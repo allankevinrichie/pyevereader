@@ -1,0 +1,20 @@
+[package]
+name = "pyevereader"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "pyevereader"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "playground"
+path = "src/main.rs"
+
+[dependencies]
+pyo3 = "0.22.0"
+winapi = { version = "0.3.9", features = ["psapi", "processthreadsapi", "handleapi", "memoryapi", "tlhelp32", "debugapi", "minwindef", "winnt", "ntdef", "winuser", "windef"] }
+libc = "0.2.155"
+wildmatch = "2.3.4"
+
