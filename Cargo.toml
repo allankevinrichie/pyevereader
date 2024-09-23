@@ -17,4 +17,3 @@ pyo3 = "0.22.0"
 winapi = { version = "0.3.9", features = ["psapi", "processthreadsapi", "handleapi", "memoryapi", "tlhelp32", "debugapi", "minwindef", "winnt", "ntdef", "winuser", "windef"] }
 libc = "0.2.155"
 wildmatch = "2.3.4"
-
