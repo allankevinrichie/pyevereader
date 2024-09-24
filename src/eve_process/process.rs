@@ -1,16 +1,19 @@
 use std::io;
 use std::ffi::{OsString};
-use std::fmt::Debug;
+use std::fmt::{Debug};
 use std::os::windows::ffi::OsStringExt;
+use std::rc::Weak;
 use winapi::shared::minwindef::{DWORD, FALSE, LPARAM, BOOL, TRUE, LPVOID};
 use winapi::shared::windef::HWND;
 use winapi::shared::ntdef::{HANDLE, NULL};
 use winapi::um::processthreadsapi::OpenProcess;
 use winapi::um::psapi::{GetProcessImageFileNameW};
-use winapi::um::winnt::{MEMORY_BASIC_INFORMATION, MEMORY_BASIC_INFORMATION64, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
+use winapi::um::winnt::{MEMORY_BASIC_INFORMATION64, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS, PMEMORY_BASIC_INFORMATION, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
 use winapi::um::winuser::{EnumWindows, GetWindowTextW, GetWindowThreadProcessId, GetWindowTextLengthW};
 use wildmatch::WildMatch;
-use winapi::um::memoryapi::VirtualQueryEx;
+use winapi::um::memoryapi::{ReadProcessMemory, VirtualQueryEx};
+use tracing::{info, debug, warn};
+use rayon::prelude::*;
 
 
 /// How many ASCII characters to read for a process name at most.
@@ -21,57 +24,66 @@ const MAX_PROC_NUM: usize = 1024;
 /// A handle to an opened process.
 #[derive(Debug)]
 pub struct Process {
-    pub(crate) pid: u32,
-    pub(crate) path: String,
-    pub(crate) title: String,
-    pub(crate) regions: Vec::<MemoryRegion>,
-    handle: HANDLE,
+    pub pid: u32,
+    pub path: String,
+    pub title: String,
+    pub regions: Vec::<MemoryRegion>,
+    handle: u32,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MemoryRegion {
-    pub(crate) start: u64,
-    pub(crate) size: u64,
-    pub(crate) data: Vec::<u8>
+    pub start: u64,
+    pub size: u64,
+    pub data: Vec::<u8>,
+    pub process: Weak<dyn ReadMemory>
 }
 
+pub trait ReadMemory {
+    fn read_memory(&self, address: u64, size: u64) -> io::Result<Vec::<u8>>;
+}
 
-impl Default for Process {
-    fn default() -> Self {
-        Process {
-            pid: 0,
-            path: String::new(),
-            title: String::new(),
-            regions: vec![],
-            handle: NULL,
+impl MemoryRegion {
+    pub fn sync(&mut self) {
+        todo!()
+    }
+}
+
+impl ReadMemory for Process {
+    fn read_memory(&self, address: u64, size: u64) -> io::Result<Vec<u8>> {
+        let mut buffer = vec![0u8; size as usize];
+        unsafe {
+            let handle = self.handle as HANDLE;
+            if ReadProcessMemory(handle, address as LPVOID, buffer.as_mut_ptr() as LPVOID, size.try_into().unwrap(), NULL as *mut _) == TRUE {
+                Ok(buffer)
+            } else {
+                Err(io::Error::last_os_error())
+            }
         }
     }
 }
 
 impl Process {
-    pub fn new(pid: u32, path: &str, title: &str) -> io::Result<Self> {
+    pub fn list(pid: Option<u32>, path:Option<&str>, title: Option<&str>) -> io::Result<Vec::<Self>> {
         match list_processes() {
             Err(e) => Err(e),
             Ok(processes) => {
-                let filtered = processes.iter().filter(
+                debug!("{:?} {}", &processes, "Processes found");
+                let filtered = processes.into_iter().filter(
                     |proc|
-                        (proc.pid > 0 || proc.pid == pid) &&
-                        (path.is_empty() || WildMatch::new(proc.path.as_str()).matches(path)) &&
-                        (title.is_empty() || WildMatch::new(proc.title.as_str()).matches(title))
+                        (pid.is_none() || proc.pid == pid.unwrap()) &&
+                        (path.is_none() || WildMatch::new(path.unwrap()).matches(&proc.path)) &&
+                        (title.is_none() || WildMatch::new(title.unwrap()).matches(&proc.title))
                 ).collect::<Vec<Self>>();
                 if filtered.is_empty() {
-                    Err(io::Error::new(io::ErrorKind::NotFound, "Process not found (pid={pid}, path={path}, title={title})"))
-                } else if filtered.len() > 1 {
-                    Err(io::Error::new(io::ErrorKind::AlreadyExists, "Multiple processes found (pid={pid}, path={path}, title={title})"))
+                    Err(io::Error::new(io::ErrorKind::NotFound, format!("Process not found (pid={pid:?}, path={path:?}, title={title:?})")))
                 } else {
-                    match filtered {
-                        [first, ..] => Ok(first)
-                    }
+                    Ok(filtered)
                 }
             }
         }
    }
-    pub fn load_memory_regions(&mut self, pid: u32) {
+    pub fn enum_memory_regions(& mut self) {
         let mut mem_info = MEMORY_BASIC_INFORMATION64 {
             BaseAddress: 0,
             AllocationBase: 0,
@@ -86,13 +98,15 @@ impl Process {
         let mut current_address: LPVOID  = NULL;
         self.regions.clear();
         unsafe {
-            while VirtualQueryEx(self.handle, current_address, *mem_info, size_of::<MEMORY_BASIC_INFORMATION64>()) == size_of::<MEMORY_BASIC_INFORMATION64>() {
+
+            while VirtualQueryEx(self.handle as HANDLE, current_address, &mut mem_info as *mut _ as PMEMORY_BASIC_INFORMATION, size_of::<MEMORY_BASIC_INFORMATION64>()) == size_of::<MEMORY_BASIC_INFORMATION64>() {
                 if mem_info.State == MEM_COMMIT && mem_info.Protect & PAGE_NOACCESS == 0 && mem_info.Protect & PAGE_GUARD == 0 {
                     self.regions.push(
                         MemoryRegion {
                             start: mem_info.BaseAddress as u64,
                             size: mem_info.RegionSize,
                             data: vec![],
+                            process: Weak::<dyn ReadMemory>::from_raw(self as *const _ as *const dyn ReadMemory)
                         }
                     )
                 }
@@ -135,7 +149,7 @@ unsafe extern "system" fn list_processes_callback(hwnd: HWND, lparam: LPARAM) ->
             path: OsString::from_wide(&raw_path[..path_len as usize]).to_string_lossy().into_owned(),
             title: OsString::from_wide(&raw_title[..title_len as usize]).to_string_lossy().into_owned(),
             regions: vec![],
-            handle: raw_handle,
+            handle: raw_handle as u32,
         }
     );
     TRUE
@@ -146,5 +160,3 @@ pub fn list_processes() -> io::Result<Vec<Process>> {
     unsafe { EnumWindows(Some(list_processes_callback), &mut processes as *mut Vec<Process> as isize); }
     Ok(processes)
 }
-
-
