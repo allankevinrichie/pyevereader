@@ -20,6 +20,8 @@ wildmatch = "2.3.4"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 rayon = "1.10"
+strum_macros = "0.26.4"
+bytemuck = "1.18.0"
 
 [profile.release]
 strip = true
