@@ -138,6 +138,7 @@ name = "pyevereader"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "lazy_static",
  "libc",
  "pyo3",
  "rayon",

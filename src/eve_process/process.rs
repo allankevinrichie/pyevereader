@@ -230,9 +230,8 @@ impl Process {
         }
     }
 
-    pub fn read_cache(&mut self, addr: u64, size: usize) -> io::Result<MemoryRegion> {
+    pub fn read_cache(&self, addr: u64, size: usize) -> io::Result<MemoryRegion> {
         let (index, offset) = self.get_region_from_address(addr)?;
-        let region = &mut self.regions[index];
         self.regions.get(index).unwrap().read_bytes(offset, size)
     }
 

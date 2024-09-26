@@ -2,8 +2,8 @@ use std::mem::ManuallyDrop;
 use libc::*;
 
 macro_rules! rpointer {
-    ($T:ty) => {c_void};
-    () => {c_void}
+    ($T:ty) => {u64};
+    () => {u64}
 }
 
 type rpyobject = rpointer![CPyObject];
