@@ -1,7 +1,7 @@
 use rayon::prelude::*;
 use std::ffi::OsString;
 use std::fmt::Debug;
-use std::io;
+use std::{io, result};
 use std::io::Error;
 use std::os::windows::ffi::OsStringExt;
 use tracing::{debug, info, warn};
@@ -27,10 +27,11 @@ const MAX_PROC_NUM: usize = 1024;
 
 /// A handle to an opened process.
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub enum ProcessHandle {
     Live(u32),
     File,
+    #[default]
     None,
 }
 
@@ -40,10 +41,10 @@ pub struct Process {
     pub path: String,
     pub title: String,
     pub regions: Vec<MemoryRegion>,
-    handle: ProcessHandle,
+    pub(crate) handle: ProcessHandle,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct MemoryRegion {
     pub start: u64,
     pub size: usize,
@@ -66,11 +67,11 @@ impl MemoryRegion {
         Ok(self)
     }
 
-    pub fn sync(mut self) -> io::Result<Self> {
-        match &self.handle {
-            ProcessHandle::Live(handle) => unsafe {
+    pub fn sync(mut self) -> Result<Self, (Self, Error)> {
+        if let ProcessHandle::Live(h) = self.handle {
+            unsafe {
                 if ReadProcessMemory(
-                    *handle as HANDLE,
+                    h as HANDLE,
                     self.start as LPVOID,
                     self.data.as_mut_ptr() as LPVOID,
                     self.size as usize,
@@ -79,13 +80,11 @@ impl MemoryRegion {
                 {
                     Ok(self)
                 } else {
-                    Err(Error::last_os_error())
+                    Err((self, Error::last_os_error()))
                 }
-            },
-            ProcessHandle::File => {
-                todo!("File reading not implemented yet")
             }
-            ProcessHandle::None => Err(Error::new(io::ErrorKind::Other, "No bounded process.")),
+        } else { 
+            Err((self, Error::new(io::ErrorKind::InvalidInput, "Invalid handle"))) 
         }
     }
     
@@ -149,7 +148,7 @@ impl Process {
             }
         }
     }
-    pub fn enum_memory_regions(&mut self) {
+    pub fn enum_memory_regions(mut self) -> Self {
         let mut mem_info = MEMORY_BASIC_INFORMATION64 {
             BaseAddress: 0,
             AllocationBase: 0,
@@ -186,16 +185,20 @@ impl Process {
                     }
                     current_address = (mem_info.BaseAddress + mem_info.RegionSize) as LPVOID;
                 }
+                self
             },
-            ProcessHandle::File => {}
-            ProcessHandle::None => {}
+            ProcessHandle::File => {self}
+            ProcessHandle::None => {self}
         }
     }
 
-    pub fn sync_memory_regions(self) {
-        self.regions
+    pub fn sync_memory_regions(mut self) -> Self {
+        self.regions = self.regions
             .into_iter()
-            .for_each(|region| {let _ = region.sync();})
+            .map(|region| {
+                region.sync().unwrap_or_else(|(region, err)| region)
+            }).collect();
+        self
     }
 
     pub fn get_region_from_address(&self, addr: u64) -> io::Result<(usize, usize)> {
@@ -211,6 +214,7 @@ impl Process {
                         "Address not found in any memory region",
                     ))
                 } else {
+                    let index = index - 1;
                     let offset = addr - self.regions[index].start;
                     if addr < self.regions[index].start {
                         Err(Error::new(

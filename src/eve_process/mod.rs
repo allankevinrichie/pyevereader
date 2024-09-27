@@ -1,4 +1,4 @@
 pub mod process;
 pub mod module;
-mod eve_process;
-mod py_struct;
+pub mod eve_process;
+pub mod py_struct;
