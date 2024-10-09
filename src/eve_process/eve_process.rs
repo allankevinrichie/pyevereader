@@ -9,7 +9,7 @@ use std::rc::{Rc, Weak};
 use tracing::debug;
 
 lazy_static! {
-    static ref py_builtin_types: Vec<&'static str> = vec!["UIRoot"];
+    static ref py_builtin_types: Vec<&'static str> = vec!["dict", "UIRoot"];
 }
 
 #[derive(Debug)]
@@ -32,7 +32,7 @@ pub struct EVEProcess {
     pub process: Process,
     pub objects: HashMap<u64, Rc<PyObjectNode>>,
     pub py_type: Rc<PyObjectNode>,
-    pub ui_root: Rc<PyObjectNode>,
+    pub ui_root: Rc<PyObjectNode>
 }
 
 macro_rules! par_map_regions {
@@ -46,7 +46,7 @@ macro_rules! par_map_regions {
                     .filter_map({
                         |offset| -> Option<u64> {
                             let base_addr = region.start + offset;
-                            let data = region.view_bytes_as::<$T>(offset as usize, 8).unwrap();
+                            let data = region.view_bytes_as::<$T>(offset as usize, Some(8)).unwrap();
                             $pyobj_filter(*s, base_addr, data)
                         }
                     })
@@ -172,6 +172,7 @@ impl EVEProcess {
                     tp_name: "type".to_string(),
                     child: Default::default(),
                 });
+                self.py_type = py_type.clone();
                 self.objects.insert(tp_candidate, py_type.clone());
                 for (&tp_name, &tp_addr) in
                     verified_type_candidates.get(&tp_candidate).unwrap().iter()
@@ -192,10 +193,12 @@ impl EVEProcess {
                         tp_name: tp_name.to_string(),
                         child: Default::default(),
                     });
+                    if tp_name.eq("UIRoot") {
+                        self.ui_root = tp_obj.clone();
+                    }
                     self.objects.insert(tp_addr, tp_obj);
                 }
                 verified_type_addr = tp_candidate;
-                self.py_type = py_type;
                 break;
             }
         }
@@ -230,8 +233,35 @@ impl EVEProcess {
             })
         )
     }
-    
-    pub fn search_object(&self, tp_addr: u64, obj_addr: u64) -> Vec<u64> {
-        
+
+    pub fn search_ui_root(&self, tp_addr: Option<u64>) -> Vec<u64> {
+        let tp_addr = tp_addr.unwrap_or(self.ui_root.base_addr);
+        par_map_regions!(
+            CPyCustomObject,
+            self.process,
+            ({
+                |proc: &Process, base_addr, data: &CPyCustomObject| -> Option<u64> {
+                    if data.ob_base.ob_type == tp_addr {
+                        let attr_p = data.attributes;
+                        if let Ok(ref tp_name_bytes) =
+                            proc.read_cache(attr_p, size_of::<CPyDictObject>()).borrow()
+                        {
+                            if let Ok(attr_dict) = tp_name_bytes.view_bytes_as::<CPyDictObject>(0, None) {
+                                if let Ok(attr_dict_data) = proc.read_cache(attr_dict.ob_base.ob_type, size_of::<CPyTypeObject>()).borrow() {
+                                    if let Ok(attr_dict_type) = attr_dict_data.view_bytes_as::<CPyTypeObject>(0, None) {
+                                        if let Ok(attr_dict_type_name) = proc.read_cache(attr_dict_type.tp_name, 4).borrow() {
+                                            if attr_dict_type_name.view_bytes(0, 4).unwrap_or("".as_bytes()).eq("dict".as_bytes()) {
+                                                return Some(base_addr);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    None
+                }
+            })
+        )
     }
 }

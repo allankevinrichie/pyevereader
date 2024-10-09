@@ -109,7 +109,8 @@ impl MemoryRegion {
         }
     }
     
-    pub fn view_bytes_as<T>(&self, offset: usize, size: usize) -> io::Result<&T> {
+    pub fn view_bytes_as<T>(&self, offset: usize, size: Option<usize>) -> io::Result<&T> {
+        let size = size.unwrap_or(size_of::<T>());
         if offset + size > self.size {
             Err(Error::new(io::ErrorKind::InvalidInput, "Invalid offset or size"))
         } else { 

@@ -124,3 +124,9 @@ pub struct CPyUnicodeObject {
     pub hash: c_long,
     pub defenc: rpyobject
 }
+
+#[repr(C)]
+pub struct CPyCustomObject {
+    pub ob_base: CPyObject,
+    pub attributes: rpointer![CPyDictObject]
+}

@@ -13,6 +13,11 @@ fn main() -> io::Result<()> {
     let mut found = EVEProcess::list().unwrap();
     let mut proc = found.remove(0);
     proc.init();
-    println!("0x{:X}", proc.search_type("UIRoot", None).get(0).unwrap());
+    // let &ui_root_type = proc.search_type("UIRoot", None).get(0).unwrap();
+    println!("type: {}", proc.py_type.base_addr);
+    println!("UIRoot type: 0x{:X}", proc.ui_root.base_addr);
+    for ui_root_candidate in proc.search_ui_root(None) {
+        println!("{:?}", ui_root_candidate);
+    }
     Ok(())
 }
