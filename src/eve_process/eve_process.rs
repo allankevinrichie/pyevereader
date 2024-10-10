@@ -24,15 +24,15 @@ pub struct PyObjectNode {
     pub region: MemoryRegion,
     pub ob_type: Weak<PyObjectNode>,
     pub tp_name: String,
-    pub child: HashMap<Index, Rc<PyObjectNode>>,
+    pub child: HashMap<Index, Weak<PyObjectNode>>,
 }
 
 #[derive(Debug)]
 pub struct EVEProcess {
     pub process: Process,
     pub objects: HashMap<u64, Rc<PyObjectNode>>,
-    pub py_type: Rc<PyObjectNode>,
-    pub ui_root: Rc<PyObjectNode>
+    pub py_type: Weak<PyObjectNode>,
+    pub ui_root: Weak<PyObjectNode>
 }
 
 macro_rules! par_map_regions {
@@ -79,6 +79,7 @@ macro_rules! par_map_regions {
     };
 }
 
+#[profiling::all_functions]
 impl EVEProcess {
     pub fn list() -> io::Result<Vec<EVEProcess>> {
         let p: Vec<_> = Process::list(None, Some("*exefile*"), Some("*星战前夜*"))?
@@ -172,11 +173,12 @@ impl EVEProcess {
                     tp_name: "type".to_string(),
                     child: Default::default(),
                 });
-                self.py_type = py_type.clone();
                 self.objects.insert(tp_candidate, py_type.clone());
+                self.py_type = Rc::downgrade(&py_type);
                 for (&tp_name, &tp_addr) in
                     verified_type_candidates.get(&tp_candidate).unwrap().iter()
                 {
+                    
                     let tp_obj = Rc::new(PyObjectNode {
                         base_addr: tp_addr,
                         region: MemoryRegion {
@@ -193,10 +195,10 @@ impl EVEProcess {
                         tp_name: tp_name.to_string(),
                         child: Default::default(),
                     });
+                    self.objects.insert(tp_addr, tp_obj.clone());
                     if tp_name.eq("UIRoot") {
-                        self.ui_root = tp_obj.clone();
+                        self.ui_root = Rc::downgrade(&tp_obj);
                     }
-                    self.objects.insert(tp_addr, tp_obj);
                 }
                 verified_type_addr = tp_candidate;
                 break;
@@ -210,7 +212,11 @@ impl EVEProcess {
     }
 
     pub fn search_type(&self, tp_name: &str, tp_addr: Option<u64>) -> Vec<u64> {
-        let tp_candidate = tp_addr.unwrap_or(self.py_type.base_addr);
+        
+        let tp_candidate = tp_addr.unwrap_or_else(|| {match self.py_type.upgrade() {
+            Some(type_obj) => { type_obj.base_addr }
+            _ => {panic!("Invalid type addr.")}
+        }});
         par_map_regions!(
             CPyTypeObject,
             self.process,
@@ -235,7 +241,12 @@ impl EVEProcess {
     }
 
     pub fn search_ui_root(&self, tp_addr: Option<u64>) -> Vec<u64> {
-        let tp_addr = tp_addr.unwrap_or(self.ui_root.base_addr);
+        let tp_addr = tp_addr.unwrap_or_else(|| {
+            match self.ui_root.upgrade() {
+                Some(ui_root) => { ui_root.base_addr }
+                _ => {panic!("Invalid UIRoot addr.")}
+            }
+        });
         par_map_regions!(
             CPyCustomObject,
             self.process,
@@ -263,5 +274,9 @@ impl EVEProcess {
                 }
             })
         )
+    }
+    
+    pub fn parse_ui_tree(&self, ui_root_addr: u64) -> Option<PyObjectNode> {
+        todo!()
     }
 }

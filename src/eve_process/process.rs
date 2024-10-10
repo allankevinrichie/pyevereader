@@ -3,7 +3,9 @@ use std::ffi::OsString;
 use std::fmt::Debug;
 use std::{io, result};
 use std::io::Error;
+use std::num::NonZeroUsize;
 use std::os::windows::ffi::OsStringExt;
+use lazy_static::lazy_static;
 use tracing::{debug, info, warn};
 use wildmatch::WildMatch;
 use winapi::shared::minwindef::{BOOL, DWORD, FALSE, LPARAM, LPVOID, TRUE};
@@ -12,18 +14,27 @@ use winapi::shared::windef::HWND;
 use winapi::um::memoryapi::{ReadProcessMemory, VirtualQueryEx};
 use winapi::um::processthreadsapi::OpenProcess;
 use winapi::um::psapi::GetProcessImageFileNameW;
-use winapi::um::winnt::{
-    MEMORY_BASIC_INFORMATION64, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS, PMEMORY_BASIC_INFORMATION,
-    PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
-};
+use winapi::um::winnt::{MEMORY_BASIC_INFORMATION64, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PMEMORY_BASIC_INFORMATION, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
 use winapi::um::winuser::{
     EnumWindows, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
 };
+use lru::LruCache;
+use std::sync::Mutex;
+use winapi::um::sysinfoapi::{GetSystemInfo, SYSTEM_INFO};
 
 /// How many ASCII characters to read for a process name at most.
 const MAX_PROC_NAME_LEN: usize = 128;
 const MAX_PROC_PATH_LEN: usize = 1024;
 const MAX_PROC_NUM: usize = 1024;
+const MEMORY_MAP_CACHE_SIZE: usize = 1<<6;
+
+
+
+lazy_static!{
+    static ref _memory_map_cache: Mutex<LruCache::<u64, (usize, usize)>> = 
+    Mutex::new(LruCache::new(NonZeroUsize::new(MEMORY_MAP_CACHE_SIZE).unwrap()));
+}
+
 
 /// A handle to an opened process.
 
@@ -52,6 +63,7 @@ pub struct MemoryRegion {
     pub handle: ProcessHandle,
 }
 
+#[profiling::all_functions]
 impl MemoryRegion {
     pub fn new(start: u64, size: usize, handle: ProcessHandle, data: Option<Vec<u8>>) -> io::Result<Self> {
         Ok(MemoryRegion {
@@ -83,8 +95,8 @@ impl MemoryRegion {
                     Err((self, Error::last_os_error()))
                 }
             }
-        } else { 
-            Err((self, Error::new(io::ErrorKind::InvalidInput, "Invalid handle"))) 
+        } else {
+            Err((self, Error::new(io::ErrorKind::InvalidInput, "Invalid handle")))
         }
     }
     
@@ -119,6 +131,7 @@ impl MemoryRegion {
     }
 }
 
+#[profiling::all_functions]
 impl Process {
     pub fn list(
         pid: Option<u32>,
@@ -150,6 +163,49 @@ impl Process {
         }
     }
     pub fn enum_memory_regions(mut self) -> Self {
+        let mut sysinfo: SYSTEM_INFO = unsafe { std::mem::zeroed() };
+        unsafe { GetSystemInfo(&mut sysinfo)}
+        let min_addr = sysinfo.lpMinimumApplicationAddress as u64;
+        let max_addr = sysinfo.lpMaximumApplicationAddress as u64;
+        println!("min_addr: {:X}, max_addr: {:X}", min_addr, max_addr);
+        let step = 256 * (1 << 20);
+        let batch_size = step * 256;
+        let num_batches = ((max_addr - min_addr + 1) / batch_size);
+        let mut regions_list = Vec::with_capacity(num_batches as usize);
+        for i in 0..num_batches {
+            let batch_min_addr = i * batch_size + min_addr;
+            let batch_max_addr = (i + 1) * batch_size + min_addr;
+            let range: Vec<u64> = (batch_min_addr..batch_max_addr).step_by(step as usize).collect();
+            let sub_regions: Vec<Vec<MemoryRegion>> = range.into_par_iter().filter_map(
+                |start: u64| -> Option<Vec<MemoryRegion>> {
+                    let regions = self.enum_memory_regions_in_range(start, start + step as u64);
+                    if regions.is_empty() {
+                        return None;
+                    } else {
+                        return Some(regions);
+                    }
+                }
+            ).collect();
+            regions_list.push(sub_regions);
+        }
+
+        self.regions = regions_list.into_par_iter().filter(|x| !x.is_empty()).reduce(
+            || Vec::new(),
+            |mut acc, x| {
+                acc.extend(x);
+                acc
+            }
+        ).into_par_iter().filter(|x| !x.is_empty()).reduce(
+            || Vec::new(),
+            |mut acc, x| {
+                acc.extend(x);
+                acc
+            }
+        );
+        self
+    }
+    
+    fn enum_memory_regions_in_range(&self, start: u64, end: u64) -> Vec<MemoryRegion> {
         let mut mem_info = MEMORY_BASIC_INFORMATION64 {
             BaseAddress: 0,
             AllocationBase: 0,
@@ -161,12 +217,11 @@ impl Process {
             Type: 0,
             __alignment2: 0,
         };
-        let mut current_address: LPVOID = NULL;
-        self.regions.clear();
-
+        let mut regions = Vec::new();
+        let mut current_address: LPVOID = start as LPVOID;
         match self.handle {
             ProcessHandle::Live(handle) => unsafe {
-                while VirtualQueryEx(
+                while current_address < end as LPVOID && VirtualQueryEx(
                     handle as HANDLE,
                     current_address,
                     &mut mem_info as *mut _ as PMEMORY_BASIC_INFORMATION,
@@ -176,8 +231,9 @@ impl Process {
                     if mem_info.State == MEM_COMMIT
                         && mem_info.Protect & PAGE_NOACCESS == 0
                         && mem_info.Protect & PAGE_GUARD == 0
+                        && mem_info.Protect & (PAGE_READONLY | PAGE_READWRITE) != 0
                     {
-                        self.regions.push(MemoryRegion::new(
+                        regions.push(MemoryRegion::new(
                             mem_info.BaseAddress,
                             mem_info.RegionSize as usize,
                             ProcessHandle::Live(handle),
@@ -186,26 +242,27 @@ impl Process {
                     }
                     current_address = (mem_info.BaseAddress + mem_info.RegionSize) as LPVOID;
                 }
-                self
+                regions
             },
-            ProcessHandle::File => {self}
-            ProcessHandle::None => {self}
+            ProcessHandle::File => {regions}
+            ProcessHandle::None => {regions}
         }
     }
 
     pub fn sync_memory_regions(mut self) -> Self {
         self.regions = self.regions
-            .into_iter()
-            .map(|region| {
-                region.sync().unwrap_or_else(|(region, err)| region)
+            .into_par_iter()
+            .filter_map(|region| {
+                region.sync().ok()
             }).collect();
         self
     }
 
     pub fn get_region_from_address(&self, addr: u64) -> io::Result<(usize, usize)> {
-        match self
-            .regions
-            .binary_search_by_key(&addr, |region| region.start)
+        if let Some(&res) = _memory_map_cache.lock().unwrap().get(&addr) {
+            return Ok(res);
+        }
+        let res = match self.regions.binary_search_by_key(&addr, |region| region.start)
         {
             Ok(index) => Ok((index, 0)),
             Err(index) => {
@@ -232,6 +289,13 @@ impl Process {
                     }
                 }
             }
+        };
+        match res {
+            Ok((index, offset)) => {
+                _memory_map_cache.lock().unwrap().put(addr, (index, offset));
+                Ok((index, offset))
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -265,6 +329,7 @@ impl Process {
     }
 }
 
+#[profiling::function]
 unsafe extern "system" fn list_processes_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let processes = &mut *(lparam as *mut Vec<Process>);
 
@@ -309,6 +374,7 @@ unsafe extern "system" fn list_processes_callback(hwnd: HWND, lparam: LPARAM) ->
     TRUE
 }
 
+#[profiling::function]
 pub fn list_processes() -> io::Result<Vec<Process>> {
     let mut processes = Vec::<Process>::with_capacity(MAX_PROC_NUM);
     unsafe {

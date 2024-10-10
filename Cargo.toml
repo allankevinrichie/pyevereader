@@ -23,7 +23,18 @@ rayon = "1.10"
 strum_macros = "0.26.4"
 bytemuck = "1.18.0"
 lazy_static = "1.5.0"
+lru = "0.12.5"
+timeit = "0.1.2"
+profiling = "1.0"
 
 [profile.release]
+opt-level = 3
+debug = true
 strip = true
 lto = true
+
+[features]
+profile-with-optick = ["profiling/profile-with-optick"]
+profile-with-superluminal = ["profiling/profile-with-superluminal"]
+profile-with-tracing = ["profiling/profile-with-tracing"]
+profile-with-tracy = ["profiling/profile-with-tracy"]
