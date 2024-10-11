@@ -167,7 +167,6 @@ impl Process {
         unsafe { GetSystemInfo(&mut sysinfo)}
         let min_addr = sysinfo.lpMinimumApplicationAddress as u64;
         let max_addr = sysinfo.lpMaximumApplicationAddress as u64;
-        println!("min_addr: {:X}, max_addr: {:X}", min_addr, max_addr);
         let step = 256 * (1 << 20);
         let batch_size = step * 256;
         let num_batches = ((max_addr - min_addr + 1) / batch_size);
@@ -202,6 +201,7 @@ impl Process {
                 acc
             }
         );
+        self.regions.sort_by_key(|x| x.start);
         self
     }
     
@@ -304,7 +304,7 @@ impl Process {
         self.regions.get(index).unwrap().read_bytes(offset, size)
     }
 
-    pub fn read_memory(&mut self, addr: u64, size: usize) -> io::Result<Vec<u8>> {
+    pub fn read_memory(&self, addr: u64, size: usize) -> io::Result<MemoryRegion> {
         match self.handle {
             ProcessHandle::Live(handle) => unsafe {
                 let mut data = vec![0; size];
@@ -316,7 +316,12 @@ impl Process {
                     NULL as *mut _,
                 ) == TRUE
                 {
-                    Ok(data)
+                    Ok(MemoryRegion {
+                        start: addr,
+                        size,
+                        data,
+                        handle: self.handle,
+                    })
                 } else {
                     Err(Error::last_os_error())
                 }

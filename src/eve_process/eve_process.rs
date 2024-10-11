@@ -276,7 +276,11 @@ impl EVEProcess {
         )
     }
     
-    pub fn parse_ui_tree(&self, ui_root_addr: u64) -> Option<PyObjectNode> {
+    pub fn parse_ui_tree(&mut self, ui_root_addr: u64) -> Option<PyObjectNode> {
+        let region = self.process.read_cache(ui_root_addr, size_of::<CPyCustomObject>()).ok()?;
+        let py_obj_view = region.view_bytes_as::<CPyCustomObject>(0, None).ok()?;
+
+        
         todo!()
     }
 }
