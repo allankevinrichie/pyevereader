@@ -126,7 +126,23 @@ impl MemoryRegion {
         if offset + size > self.size {
             Err(Error::new(io::ErrorKind::InvalidInput, "Invalid offset or size"))
         } else { 
-            Ok(unsafe { &*(self.data[offset..offset + size].as_ptr() as *const T) })
+            Ok(unsafe { (self.data[offset..offset + size].as_ptr() as *const T).as_ref().unwrap() })
+        }
+    }
+    
+    pub fn view_bytes_as_vec_of<T: Clone>(&self, offset: usize, size: usize) -> io::Result<Vec<&T>> {
+        if offset + size > self.size {
+            Err(Error::new(io::ErrorKind::InvalidInput, "Invalid offset or size"))
+        } else {
+            let v: Vec::<&T>;
+            Ok(unsafe {
+                let t: Vec<_> = self.data[offset..offset + size]
+                    .into_iter()
+                    .step_by(size_of::<T>())
+                    .map(|x| (std::ptr::from_ref(x) as *const T).as_ref().unwrap())
+                    .collect();
+                t
+            })
         }
     }
 }
