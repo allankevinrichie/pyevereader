@@ -94,10 +94,10 @@ impl PyObjectNode {
         let mut pyobj_region = eve.process.read_memory(base_addr, size_of::<CPyObject>())?;
         let pyobj_view = pyobj_region.view_bytes_as::<CPyObject>(0, None)?;
         let pyobj_type_addr = pyobj_view.ob_type;
-        
+
         let mut tp_obj;
         let mut tp_name_inferred;
-        // get existing type objects or new one to cache, we assume that no new type object 
+        // get existing type objects or new one to cache, we assume that no new type object
         // will be created
         if pyobj_type_addr == base_addr {
             if eve.objects.contains_key(&base_addr) {
