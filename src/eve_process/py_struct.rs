@@ -33,7 +33,7 @@ pub struct CPyTypeObject {
 }
 
 #[repr(C)]
-pub struct CPyByteArrayExtra {
+pub struct CPyByteArrayObject {
     pub ob_base: CPyVarObject,
     pub ob_exports: c_int,
     pub ob_alloc: ssize_t,
@@ -48,7 +48,7 @@ pub struct CPyStringObject {
     pub ob_sval: rarray![c_char]
 }
 
-type CPyBytesObject = CPyStringObject;
+pub type CPyBytesObject = CPyStringObject;
 
 #[repr(C)]
 pub struct CPyDictEntry {
@@ -80,7 +80,7 @@ pub struct CPyIntObject {
     pub ob_ival: c_long
 }
 
-type CPyBoolObject = CPyIntObject;
+pub type CPyBoolObject = CPyIntObject;
 
 #[repr(C)]
 pub struct CPyListObject {

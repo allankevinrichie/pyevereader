@@ -4,13 +4,18 @@ use lazy_static::lazy_static;
 use rayon::prelude::*;
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasher, Hash};
 use std::io;
 use std::rc::{Rc, Weak};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::debug;
+use rustc_hash::FxBuildHasher;
 
 lazy_static! {
-    static ref py_builtin_types: Vec<&'static str> = vec!["dict", "UIRoot"];
+    static ref _py_types: Vec<&'static str> = vec!["UIRoot"];
 }
+
+// static HASHER: FxHasher = FxHasher::default();
 
 #[derive(Debug)]
 pub enum Index {
@@ -25,14 +30,15 @@ pub struct PyObjectNode {
     pub ob_type: Weak<PyObjectNode>,
     pub tp_name: String,
     pub child: HashMap<Index, Weak<PyObjectNode>>,
+    pub extra: HashMap<u64, MemoryRegion>
 }
 
 #[derive(Debug)]
 pub struct EVEProcess {
     pub process: Process,
     pub objects: HashMap<u64, Rc<PyObjectNode>>,
-    pub py_type: Weak<PyObjectNode>,
-    pub ui_root: Weak<PyObjectNode>
+    pub py_type: u64,
+    pub ui_root: u64
 }
 
 macro_rules! par_map_regions {
@@ -79,6 +85,115 @@ macro_rules! par_map_regions {
     };
 }
 
+impl PyObjectNode {
+    pub fn new_from_memory(base_addr: u64, eve: &mut EVEProcess) -> io::Result<Rc<Self>> {
+        if base_addr == 0 {
+            return Err(io::Error::new(io::ErrorKind::Other, "invalid base_addr"));
+        }
+        let mut tp_name_size = 255;
+        let mut pyobj_region = eve.process.read_memory(base_addr, size_of::<CPyObject>())?;
+        let pyobj_view = pyobj_region.view_bytes_as::<CPyObject>(0, None)?;
+        let pyobj_type_addr = pyobj_view.ob_type;
+        
+        let mut tp_obj;
+        let mut tp_name_inferred;
+        // get existing type objects or new one to cache, we assume that no new type object 
+        // will be created
+        if pyobj_type_addr == base_addr {
+            if eve.objects.contains_key(&base_addr) {
+                return Ok(eve.objects.get(&base_addr).unwrap().clone());
+            }
+            let pyobj_type_region = eve.process.read_cache(pyobj_type_addr, size_of::<CPyTypeObject>())?;
+            let obj = Rc::new_cyclic(|tp| Self {
+                base_addr,
+                region: pyobj_type_region,
+                ob_type: tp.clone(),
+                tp_name: "type".to_string(),
+                child: Default::default(),
+                extra: Default::default(),
+            });
+            eve.objects.insert(base_addr, obj.clone());
+            return Ok(obj);
+        } else if eve.objects.contains_key(&pyobj_type_addr) {
+            tp_obj = eve.objects.get(&pyobj_type_addr).unwrap().clone();
+            tp_name_inferred = tp_obj.tp_name.clone();
+        } else {
+            let pyobj_type_region = eve.process.read_cache(pyobj_type_addr, size_of::<CPyTypeObject>())?;
+            let pyobj_tp_name_addr = pyobj_type_region.view_bytes_as::<CPyTypeObject>(0, None)?.tp_name;
+            let pyobj_tp_name_region = eve.process.read_cache(pyobj_tp_name_addr, tp_name_size)?;
+            let pyobj_tp_name = &pyobj_tp_name_region.data;
+            for l in 0..tp_name_size {
+                if pyobj_tp_name[l] == 0 {
+                    tp_name_size = l;
+                    break;
+                }
+            }
+            tp_name_inferred = if tp_name_size > 0 {
+                String::from_utf8_lossy(&pyobj_tp_name[0..tp_name_size]).into_owned()
+            } else {
+                return Err(io::Error::new(io::ErrorKind::Other, "invalid ob_type"));
+            };
+            tp_obj = Rc::new_cyclic(|tp| PyObjectNode {
+                base_addr: pyobj_type_addr,
+                region: pyobj_type_region,
+                ob_type: tp.clone(),
+                tp_name: String::from_utf8_lossy(&pyobj_tp_name[0..tp_name_size]).into_owned(),
+                child: Default::default(),
+                extra: HashMap::from([(pyobj_tp_name_addr, eve.process.read_cache(pyobj_tp_name_addr, tp_name_size).unwrap())]),
+            });
+            eve.objects.insert(pyobj_type_addr, tp_obj.clone());
+        }
+
+        // remove type object from cache if it exists
+        if eve.objects.contains_key(&base_addr) {
+            eve.objects.remove(&base_addr);
+        }
+
+        // handle var python object
+        let var_size: usize = match tp_name_inferred.as_str() {
+            "str" | "bytearray" | "bytes" | "list" | "long" | "tuple" => {
+                let var_region = eve.process.read_memory(base_addr, size_of::<CPyVarObject>())?;
+                let var_view = var_region.view_bytes_as::<CPyVarObject>(0, None)?;
+                var_view.ob_size.abs() as usize
+            },
+            _ => { 0 }
+        };
+
+        let obj_size: usize = match tp_name_inferred.as_str() {
+            "str" => { size_of::<CPyStringObject>() }
+            "bytearray" => { size_of::<CPyByteArrayObject>() }
+            "bytes" => { size_of::<CPyBytesObject>() }
+            "list" => { size_of::<CPyListObject>() }
+            "long" => { size_of::<CPyLongObject>() }
+            "tuple" => { size_of::<CPyTupleObject>() }
+            "dict" => { size_of::<CPyDictObject>() }
+            "bool" => { size_of::<CPyBoolObject>() }
+            "float" => { size_of::<CPyFloatObject>() }
+            "int" => { size_of::<CPyIntObject>() }
+            "NoneType" => { size_of::<CPyObject>() }
+            "unicode" => { size_of::<CPyUnicodeObject>() }
+            "type" => { size_of::<CPyTypeObject>() }
+            _ => { size_of::<CPyCustomObject>() }
+        };
+
+        // reload region with new size
+        pyobj_region = eve.process.read_memory(base_addr, obj_size + var_size)?;
+        let obj = Rc::new(Self {
+            base_addr,
+            region: pyobj_region,
+            ob_type: Rc::downgrade(&tp_obj),
+            tp_name: tp_name_inferred,
+            child: Default::default(),
+            extra: Default::default(),
+        });
+        eve.objects.insert(base_addr, obj.clone());
+
+        Ok(obj)
+    }
+
+
+}
+
 #[profiling::all_functions]
 impl EVEProcess {
     pub fn list() -> io::Result<Vec<EVEProcess>> {
@@ -90,14 +205,14 @@ impl EVEProcess {
                 EVEProcess {
                     process: proc,
                     objects: Default::default(),
-                    py_type: Default::default(),
-                    ui_root: Default::default(),
+                    py_type: 0,
+                    ui_root: 0,
                 }
             })
             .collect();
         Ok(p)
     }
-    pub fn init(&mut self) -> Option<u64> {
+    pub fn init(&mut self) -> io::Result<u64> {
         // find python type type candidates,
         // where ob_type should be it's addr and tp_name should be "type"
         let type_candidates: HashSet<_> = par_map_regions!(
@@ -119,14 +234,14 @@ impl EVEProcess {
                 }
             })
         );
-        // find addrs of some python builtin types with type type candidates,
+        // find addrs of some python types with type type candidates,
         // can be used to filter out false type candidates
         let mut verified_type_candidates: HashMap<u64, HashMap<&str, u64>> = HashMap::default();
         let mut verified_type_addr = 0u64;
         // verify type candidates, until valid type addr is found
         'candidate: for &tp_candidate in type_candidates.iter() {
-            for &tp_name in py_builtin_types.iter() {
-                let found = self.search_type(tp_name, Some(tp_candidate));
+            for &tp_name in _py_types.iter() {
+                let found = self.search_type(tp_name, Some(tp_candidate))?;
                 if found.len() == 0 {
                     debug!(
                         "{} not found for type candidate: {}, skipped.",
@@ -150,54 +265,24 @@ impl EVEProcess {
                     }
                 }
             }
-            // if all builtin types are found, we can use this type candidate
+            // if all types are found, we can use this type candidate
             if verified_type_candidates.contains_key(&tp_candidate)
                 && verified_type_candidates.get(&tp_candidate).unwrap().len()
-                    == py_builtin_types.len()
+                    == _py_types.len()
             {
                 debug!("Found verified type candidate: {}", tp_candidate);
                 self.objects = Default::default();
-                let py_type = Rc::new(PyObjectNode {
-                    base_addr: tp_candidate,
-                    region: MemoryRegion {
-                        start: tp_candidate,
-                        size: size_of::<CPyTypeObject>(),
-                        data: self
-                            .process
-                            .read_cache(tp_candidate, size_of::<CPyTypeObject>())
-                            .unwrap()
-                            .data,
-                        handle: self.process.handle,
-                    },
-                    ob_type: Default::default(),
-                    tp_name: "type".to_string(),
-                    child: Default::default(),
-                });
+                let py_type = PyObjectNode::new_from_memory(tp_candidate, self)?;
                 self.objects.insert(tp_candidate, py_type.clone());
-                self.py_type = Rc::downgrade(&py_type);
+                self.py_type = tp_candidate;
                 for (&tp_name, &tp_addr) in
                     verified_type_candidates.get(&tp_candidate).unwrap().iter()
                 {
                     
-                    let tp_obj = Rc::new(PyObjectNode {
-                        base_addr: tp_addr,
-                        region: MemoryRegion {
-                            start: tp_addr,
-                            size: size_of::<CPyTypeObject>(),
-                            data: self
-                                .process
-                                .read_cache(tp_addr, size_of::<CPyTypeObject>())
-                                .unwrap()
-                                .data,
-                            handle: self.process.handle,
-                        },
-                        ob_type: Rc::downgrade(&py_type),
-                        tp_name: tp_name.to_string(),
-                        child: Default::default(),
-                    });
+                    let tp_obj = PyObjectNode::new_from_memory(tp_addr, self)?;
                     self.objects.insert(tp_addr, tp_obj.clone());
                     if tp_name.eq("UIRoot") {
-                        self.ui_root = Rc::downgrade(&tp_obj);
+                        self.ui_root = tp_addr;
                     }
                 }
                 verified_type_addr = tp_candidate;
@@ -205,19 +290,22 @@ impl EVEProcess {
             }
         }
         if verified_type_addr != 0 {
-            Some(verified_type_addr)
+            Ok(verified_type_addr)
         } else {
-            None
+            Err(io::Error::new(io::ErrorKind::Other, "Failed to find verified type candidate."))
         }
     }
 
-    pub fn search_type(&self, tp_name: &str, tp_addr: Option<u64>) -> Vec<u64> {
+    pub fn search_type(&self, tp_name: &str, tp_addr: Option<u64>) -> io::Result<Vec<u64>> {
         
-        let tp_candidate = tp_addr.unwrap_or_else(|| {match self.py_type.upgrade() {
-            Some(type_obj) => { type_obj.base_addr }
-            _ => {panic!("Invalid type addr.")}
-        }});
-        par_map_regions!(
+        let tp_candidate = tp_addr.unwrap_or(self.py_type);
+        if tp_candidate == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "No invalid tp_addr provided."
+            ));
+        }
+        let res = par_map_regions!(
             CPyTypeObject,
             self.process,
             ({
@@ -237,17 +325,19 @@ impl EVEProcess {
                     None
                 }
             })
-        )
+        );
+        Ok(res)
     }
 
-    pub fn search_ui_root(&self, tp_addr: Option<u64>) -> Vec<u64> {
-        let tp_addr = tp_addr.unwrap_or_else(|| {
-            match self.ui_root.upgrade() {
-                Some(ui_root) => { ui_root.base_addr }
-                _ => {panic!("Invalid UIRoot addr.")}
-            }
-        });
-        par_map_regions!(
+    pub fn search_ui_root(&self, tp_addr: Option<u64>) -> io::Result<Vec<u64>> {
+        let tp_addr = tp_addr.unwrap_or(self.ui_root);
+        if tp_addr == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "No invalid tp_addr provided."
+            ))
+        }
+        let res = par_map_regions!(
             CPyCustomObject,
             self.process,
             ({
@@ -273,14 +363,15 @@ impl EVEProcess {
                     None
                 }
             })
-        )
+        );
+        Ok(res)
     }
     
     pub fn parse_ui_tree(&mut self, ui_root_addr: u64) -> Option<PyObjectNode> {
         let region = self.process.read_cache(ui_root_addr, size_of::<CPyCustomObject>()).ok()?;
         let py_obj_view = region.view_bytes_as::<CPyCustomObject>(0, None).ok()?;
 
-        
+
         todo!()
     }
 }

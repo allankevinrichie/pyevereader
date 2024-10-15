@@ -1,15 +1,40 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fmt::Formatter;
-use std::io;
+use std::{io, slice};
 use std::os::windows::prelude::OsStringExt;
+use std::rc::Rc;
 use libc::{abs, c_char};
+use tracing_subscriber::reload::Handle;
 use crate::eve_process::eve_process::{PyObjectNode, EVEProcess};
 use crate::eve_process::py_struct::{CPyDictEntry, CPyDictObject, CPyFloatObject, CPyIntObject, CPyListObject, CPyLongObject, CPyObject, CPyStringObject, CPyTypeObject, CPyUnicodeObject};
 
 
+// macro_rules! collect_parser {
+//     ($($parser: ident), *) => {
+//         impl EVEProcess {
+//             $(
+//             pub fn parse_node<T>(&self, node: &PyObjectNode, dummy: HashMap<String, PyObjectNode>) -> io::Result<T> {
+//                 
+//                     let parser_name = stringify!($parser);
+//                     assert!(parser_name.starts_with("parse_"), "parser name must start with `parse_`");
+//                     // match parser_name[6..].as_ref() { 
+//                     //     "dict" => {
+//                     //          return self.parse_dict(node)
+//                     // 
+//                     //      },
+//                     //     _ => panic!("unreachable"),
+//                     // } ;
+//                     
+//                 todo!()
+//             }
+//             )*
+//         }
+//     };
+// }
+
 impl EVEProcess {
-     pub fn parse_dict(&self, node: &PyObjectNode) -> io::Result<HashMap<String, PyObjectNode>> {
+     pub fn parse_dict(&mut self, node: &PyObjectNode) -> io::Result<HashMap<String, Rc<PyObjectNode>>> {
          if node.tp_name != "dict" {
              return Err(io::Error::new(
                  io::ErrorKind::InvalidInput,
@@ -20,7 +45,7 @@ impl EVEProcess {
          let mask = attr_dict_view.ma_mask;
          let ma_table = attr_dict_view.ma_table;
 
-         // let mut result = HashMap::new();
+         let mut result = HashMap::new();
 
          for i in 0..mask+1 {
              if let Ok(entry_region) = self.process.read_memory(
@@ -30,47 +55,31 @@ impl EVEProcess {
                  if let Ok(entry_view) = entry_region.view_bytes_as::<CPyDictEntry>(0, None) {
                      let me_key_addr = entry_view.me_key;
                      let me_value_addr = entry_view.me_value;
-                     let key: String;
-                     if me_key_addr != 0 && me_value_addr != 0 {
-                         if let Ok(key_region) = self.process.read_memory(me_key_addr, 8) {
-                             if let Ok(key_view) = key_region.view_bytes_as::<CPyObject>(0, None) {
-                                 if let Ok(tp_region) = self.process.read_memory(key_view.ob_type, size_of::<CPyTypeObject>()) {
-                                     if let Ok(tp_view) = tp_region.view_bytes_as::<CPyTypeObject>(0, None) {
-                                         if let Ok(tp_name_region) = self.process.read_memory(tp_view.tp_name, 8) {
-                                             if tp_name_region.data[..3] == *b"str" {
-                                                 key = self.parse_str(&PyObjectNode {
-                                                     base_addr: me_key_addr,
-                                                     region: key_region,
-                                                     ob_type: Default::default(),
-                                                     tp_name: "str".to_string(),
-                                                     child: Default::default()
-                                                 })?;
-                                             }
-                                             else if tp_name_region.data[..7] == *b"unicode" {
-                                                 key = self.parse_unicode(&PyObjectNode {
-                                                     base_addr: me_key_addr,
-                                                     region: key_region,
-                                                     ob_type: Default::default(),
-                                                     tp_name: "unicode".to_string(),
-                                                     child: Default::default()
-                                                 })?;
-                                             } else {
-                                                 continue
-                                             }
-                                         }
-                                     }
-                                 }
-                             }
+                     if me_key_addr == 0 || me_value_addr == 0 {
+                         continue
+                     }
+                     if let Ok(key_obj) = PyObjectNode::new_from_memory(me_key_addr, self) {
+                         let mut key = "".to_string();
+                         if key_obj.tp_name == "str" {
+                             if let Ok(k) = self.parse_str(&key_obj) {
+                                 key = k
+                             } else { continue }
+                         } else if key_obj.tp_name == "unicode" { 
+                             if let Ok(k) = self.parse_unicode(&key_obj) {
+                                 key = k
+                             } else { continue }
+                         }
+                         if let Ok(value_obj) = PyObjectNode::new_from_memory(me_value_addr, self) {
+                             result.insert(key, value_obj);
                          }
                      }
-
                  }
              }
          }
-         todo!()
+         Ok(result)
      }
     
-    pub fn parse_list(&self, node: &PyObjectNode) -> io::Result<Vec<PyObjectNode>> {
+    pub fn parse_list(&self, node: & PyObjectNode) -> io::Result<Vec<PyObjectNode>> {
         if node.tp_name != "list" {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -79,8 +88,25 @@ impl EVEProcess {
         }
         let list_view = node.region.view_bytes_as::<CPyListObject>(0, None)?;
         let ob_size = list_view.ob_base.ob_size;
-        let item_addr_array = list_view.ob_item;
+        let var_obj_size = size_of::<CPyListObject>() + ob_size as usize - 1;
+        let resized_node = self.process.read_cache(
+            node.base_addr, var_obj_size
+        )?;
+        let item_addr_array = resized_node.view_bytes_as_vec_of::<u64>(
+            (list_view.ob_item.as_ptr() as u64 - node.base_addr) as usize, 
+            ob_size as usize
+        )?;
+        // for obj_addr in item_addr_array {
+        //     let item_addr = item_addr_array[i as usize];
+        //     self.parse_object(item_addr)?;
+        // }
+        // 
         // let mut result = Vec::with_capacity(ob_size as usize);
+        // for i in 0..ob_size {
+        //     let item_addr = item_addr_array[i as usize];
+        //     result.push(self.parse_object(item_addr)?);
+        // }
+        // 
         // node.region.view_bytes_as_vec_of::<u64>(
         //     (list_view.ob_item.as_ptr() as u64 - node.base_addr) as usize,
         //     (ob_size as u64 * size_of::<u64>() as u64) as usize
@@ -184,4 +210,5 @@ impl EVEProcess {
             io::Error::new(io::ErrorKind::InvalidInput, "parse_long failed")
         )? * (if ob_size < 0 {-1} else if ob_size > 0 {1} else { 0 }))
     }
+
  }

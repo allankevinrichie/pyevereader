@@ -17,9 +17,9 @@ fn main() -> io::Result<()> {
         proc.init();
     });
     // let &ui_root_type = proc.search_type("UIRoot", None).get(0).unwrap();
-    println!("type: {}", proc.py_type.upgrade().unwrap().base_addr);
-    println!("UIRoot type: 0x{:X}", proc.ui_root.upgrade().unwrap().base_addr);
-    for ui_root_candidate in proc.search_ui_root(None) {
+    println!("type: {}", proc.py_type);
+    println!("UIRoot type: 0x{:X}", proc.ui_root);
+    for ui_root_candidate in proc.search_ui_root(None)? {
         println!("{:?}", ui_root_candidate);
     }
     profiling::finish_frame!();

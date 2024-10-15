@@ -1,8 +1,8 @@
-[source.crates-io]
-replace-with = 'aliyun'
-[source.aliyun]
-registry = "sparse+https://mirrors.aliyun.com/crates.io-index/"
-
-
+#[source.crates-io]
+#replace-with = 'aliyun'
+#[source.aliyun]
+#registry = "sparse+https://mirrors.aliyun.com/crates.io-index/"
+#
+#
 [env]
 PYO3_PYTHON = { value = "./.venv/Scripts/python.exe", relative = true }
