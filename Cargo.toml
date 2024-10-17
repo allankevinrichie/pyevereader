@@ -27,6 +27,8 @@ lru = "0.12.5"
 timeit = "0.1.2"
 profiling = "1.0"
 rustc-hash = "2.0"
+smart-default = "0.7.1"
+loop-code = "0.5.2"
 
 [profile.release]
 opt-level = 3

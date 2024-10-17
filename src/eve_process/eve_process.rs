@@ -5,11 +5,14 @@ use rayon::prelude::*;
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hash};
-use std::io;
+use std::{io, mem};
 use std::rc::{Rc, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
+use libc::c_char;
 use tracing::debug;
 use rustc_hash::FxBuildHasher;
+use smart_default::SmartDefault;
+use crate::eve_process::eve_process::PyObject::PyTypeObject;
 
 lazy_static! {
     static ref _py_types: Vec<&'static str> = vec!["UIRoot"];
@@ -21,6 +24,28 @@ lazy_static! {
 pub enum Index {
     Name(String),
     Index(usize),
+}
+
+#[derive(Debug, SmartDefault)]
+pub enum PyObject {
+    PyObject(CPyObject),
+    PyTypeObject(CPyTypeObject),
+    PyStringObject(CPyStringObject),
+    PyUnicodeObject(CPyUnicodeObject),
+    PyBytesObject(CPyBytesObject),
+    PyByteArrayObject(CPyByteArrayObject),
+    PyListObject(CPyListObject),
+    PyTupleObject(CPyTupleObject),
+    PyDictObject(CPyDictObject),
+    PySetObject(CPySetObject),
+    PyLongObject(CPyLongObject),
+    PyFloatObject(CPyFloatObject),
+    PyIntObject(CPyIntObject),
+    PyBoolObject(CPyBoolObject),
+    PyCustomObject(CPyCustomObject),
+    PyNoneObject(),
+    #[default]
+    Invalid(),
 }
 
 #[derive(Debug, Default)]
