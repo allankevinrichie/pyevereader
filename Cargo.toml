@@ -29,6 +29,7 @@ profiling = "1.0"
 rustc-hash = "2.0"
 smart-default = "0.7.1"
 loop-code = "0.5.2"
+repr_offset = { version = "0.2", features = ["derive"] }
 
 [profile.release]
 opt-level = 3

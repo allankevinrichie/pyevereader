@@ -20,7 +20,7 @@ lazy_static! {
 
 // static HASHER: FxHasher = FxHasher::default();
 
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq, Hash)]
 pub enum Index {
     Name(String),
     Index(usize),
@@ -51,17 +51,19 @@ pub enum PyObject {
 #[derive(Debug, Default)]
 pub struct PyObjectNode {
     pub base_addr: u64,
-    pub region: MemoryRegion,
-    pub ob_type: Weak<PyObjectNode>,
+    pub ob_type: u64,
     pub tp_name: String,
-    pub child: HashMap<Index, Weak<PyObjectNode>>,
-    pub extra: HashMap<u64, MemoryRegion>
+    pub attrs: HashMap<u64, u64>,
+    pub items: Vec<u64>,
+    pub extras: Vec<u64>,
+    pub is_parsed: bool
 }
 
 #[derive(Debug)]
 pub struct EVEProcess {
     pub process: Process,
-    pub objects: HashMap<u64, Rc<PyObjectNode>>,
+    pub objects: HashMap<u64, PyObjectNode>,
+    pub regions: HashMap<u64, MemoryRegion>,
     pub py_type: u64,
     pub ui_root: u64
 }
@@ -110,42 +112,43 @@ macro_rules! par_map_regions {
     };
 }
 
-impl PyObjectNode {
-    pub fn new_from_memory(base_addr: u64, eve: &mut EVEProcess) -> io::Result<Rc<Self>> {
+impl EVEProcess {
+    pub fn new_node(&mut self, base_addr: u64) -> io::Result<&mut PyObjectNode> {
         if base_addr == 0 {
             return Err(io::Error::new(io::ErrorKind::Other, "invalid base_addr"));
         }
         let mut tp_name_size = 255;
-        let mut pyobj_region = eve.process.read_memory(base_addr, size_of::<CPyObject>())?;
+        let mut pyobj_region = self.process.read_memory(base_addr, size_of::<CPyObject>())?;
         let pyobj_view = pyobj_region.view_bytes_as::<CPyObject>(0, None)?;
         let pyobj_type_addr = pyobj_view.ob_type;
-
-        let mut tp_obj;
-        let mut tp_name_inferred;
-        // get existing type objects or new one to cache, we assume that no new type object
-        // will be created
+        
+        let tp_name_inferred;
+        // get existing type objects or put new one into cache, we assume that no new type object
+        // will be created dynamically.
         if pyobj_type_addr == base_addr {
-            if eve.objects.contains_key(&base_addr) {
-                return Ok(eve.objects.get(&base_addr).unwrap().clone());
+            if self.objects.contains_key(&base_addr) {
+                return Ok(self.objects.get_mut(&base_addr).unwrap());
             }
-            let pyobj_type_region = eve.process.read_cache(pyobj_type_addr, size_of::<CPyTypeObject>())?;
-            let obj = Rc::new_cyclic(|tp| Self {
+            let pyobj_type_region = self.process.read_cache(pyobj_type_addr, size_of::<CPyTypeObject>())?;
+            let obj = PyObjectNode {
                 base_addr,
-                region: pyobj_type_region,
-                ob_type: tp.clone(),
+                ob_type: pyobj_type_addr,
                 tp_name: "type".to_string(),
-                child: Default::default(),
-                extra: Default::default(),
-            });
-            eve.objects.insert(base_addr, obj.clone());
-            return Ok(obj);
-        } else if eve.objects.contains_key(&pyobj_type_addr) {
-            tp_obj = eve.objects.get(&pyobj_type_addr).unwrap().clone();
+                attrs: Default::default(),
+                items: vec![],
+                extras: vec![],
+                is_parsed: true,
+            };
+            self.objects.insert(base_addr, obj);
+            self.regions.insert(base_addr, pyobj_type_region);
+            return Ok(self.objects.get_mut(&base_addr).unwrap());
+        } else if self.objects.contains_key(&pyobj_type_addr) {
+            let tp_obj = self.objects.get(&pyobj_type_addr).unwrap().clone();
             tp_name_inferred = tp_obj.tp_name.clone();
         } else {
-            let pyobj_type_region = eve.process.read_cache(pyobj_type_addr, size_of::<CPyTypeObject>())?;
+            let pyobj_type_region = self.process.read_cache(pyobj_type_addr, size_of::<CPyTypeObject>())?;
             let pyobj_tp_name_addr = pyobj_type_region.view_bytes_as::<CPyTypeObject>(0, None)?.tp_name;
-            let pyobj_tp_name_region = eve.process.read_cache(pyobj_tp_name_addr, tp_name_size)?;
+            let pyobj_tp_name_region = self.process.read_cache(pyobj_tp_name_addr, tp_name_size)?;
             let pyobj_tp_name = &pyobj_tp_name_region.data;
             for l in 0..tp_name_size {
                 if pyobj_tp_name[l] == 0 {
@@ -158,26 +161,26 @@ impl PyObjectNode {
             } else {
                 return Err(io::Error::new(io::ErrorKind::Other, "invalid ob_type"));
             };
-            tp_obj = Rc::new_cyclic(|tp| PyObjectNode {
-                base_addr: pyobj_type_addr,
-                region: pyobj_type_region,
-                ob_type: tp.clone(),
+            let tp_obj = PyObjectNode {
+                base_addr,
+                ob_type: base_addr,
                 tp_name: String::from_utf8_lossy(&pyobj_tp_name[0..tp_name_size]).into_owned(),
-                child: Default::default(),
-                extra: HashMap::from([(pyobj_tp_name_addr, eve.process.read_cache(pyobj_tp_name_addr, tp_name_size).unwrap())]),
-            });
-            eve.objects.insert(pyobj_type_addr, tp_obj.clone());
+                attrs: Default::default(),
+                items: vec![],
+                extras: vec![],
+                is_parsed: true,
+            };
+            self.objects.insert(pyobj_type_addr, tp_obj);
+            self.regions.insert(pyobj_type_addr, pyobj_type_region);
         }
 
         // remove type object from cache if it exists
-        if eve.objects.contains_key(&base_addr) {
-            eve.objects.remove(&base_addr);
-        }
+        let _ = self.del_node(base_addr);
 
         // handle var python object
         let var_size: usize = match tp_name_inferred.as_str() {
             "str" | "bytearray" | "bytes" | "list" | "long" | "tuple" => {
-                let var_region = eve.process.read_memory(base_addr, size_of::<CPyVarObject>())?;
+                let var_region = self.process.read_memory(base_addr, size_of::<CPyVarObject>())?;
                 let var_view = var_region.view_bytes_as::<CPyVarObject>(0, None)?;
                 var_view.ob_size.abs() as usize
             },
@@ -202,18 +205,30 @@ impl PyObjectNode {
         };
 
         // reload region with new size
-        pyobj_region = eve.process.read_memory(base_addr, obj_size + var_size)?;
-        let obj = Rc::new(Self {
+        pyobj_region = self.process.read_memory(base_addr, obj_size + var_size)?;
+        let obj = PyObjectNode {
             base_addr,
-            region: pyobj_region,
-            ob_type: Rc::downgrade(&tp_obj),
+            ob_type: pyobj_type_addr,
             tp_name: tp_name_inferred,
-            child: Default::default(),
-            extra: Default::default(),
-        });
-        eve.objects.insert(base_addr, obj.clone());
-
-        Ok(obj)
+            attrs: Default::default(),
+            items: vec![],
+            extras: vec![],
+            is_parsed: false,
+        };
+        self.objects.insert(base_addr, obj);
+        self.regions.insert(base_addr, pyobj_region);
+        Ok(self.objects.get_mut(&base_addr).unwrap())
+    }
+    
+    pub fn del_node(&mut self, base_addr: u64) -> io::Result<()> {
+        if !self.objects.contains_key(&base_addr) {
+            return Err(io::Error::new(io::ErrorKind::Other, "invalid base_addr"));
+        }
+        let obj = self.objects.remove(&base_addr).unwrap();
+        for dedicated_regions in obj.extras.iter() {
+            self.regions.remove(dedicated_regions);
+        }
+        Ok(())
     }
 
 
@@ -230,6 +245,7 @@ impl EVEProcess {
                 EVEProcess {
                     process: proc,
                     objects: Default::default(),
+                    regions: Default::default(),
                     py_type: 0,
                     ui_root: 0,
                 }
@@ -297,15 +313,13 @@ impl EVEProcess {
             {
                 debug!("Found verified type candidate: {}", tp_candidate);
                 self.objects = Default::default();
-                let py_type = PyObjectNode::new_from_memory(tp_candidate, self)?;
-                self.objects.insert(tp_candidate, py_type.clone());
+                let py_type = self.new_node(tp_candidate)?;
                 self.py_type = tp_candidate;
                 for (&tp_name, &tp_addr) in
                     verified_type_candidates.get(&tp_candidate).unwrap().iter()
                 {
                     
-                    let tp_obj = PyObjectNode::new_from_memory(tp_addr, self)?;
-                    self.objects.insert(tp_addr, tp_obj.clone());
+                    let tp_obj = self.new_node(tp_addr)?;
                     if tp_name.eq("UIRoot") {
                         self.ui_root = tp_addr;
                     }

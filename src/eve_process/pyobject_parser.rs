@@ -9,43 +9,71 @@ use tracing_subscriber::reload::Handle;
 use crate::eve_process::eve_process::{PyObjectNode, EVEProcess};
 use crate::eve_process::py_struct::{CPyDictEntry, CPyDictObject, CPyFloatObject, CPyIntObject, CPyListObject, CPyLongObject, CPyObject, CPyStringObject, CPyTypeObject, CPyUnicodeObject};
 
-
-// macro_rules! collect_parser {
-//     ($($parser: ident), *) => {
-//         impl EVEProcess {
-//             $(
-//             pub fn parse_node<T>(&self, node: &PyObjectNode, dummy: HashMap<String, PyObjectNode>) -> io::Result<T> {
-//                 
-//                     let parser_name = stringify!($parser);
-//                     assert!(parser_name.starts_with("parse_"), "parser name must start with `parse_`");
-//                     // match parser_name[6..].as_ref() { 
-//                     //     "dict" => {
-//                     //          return self.parse_dict(node)
-//                     // 
-//                     //      },
-//                     //     _ => panic!("unreachable"),
-//                     // } ;
-//                     
-//                 todo!()
-//             }
-//             )*
-//         }
-//     };
-// }
-
 impl EVEProcess {
-     pub fn parse_dict(&mut self, node: &PyObjectNode) -> io::Result<HashMap<String, Rc<PyObjectNode>>> {
+    
+     pub fn parse_node(&mut self, addr: u64) -> io::Result<()> {
+         let node;
+         if !self.objects.contains_key(&addr) {
+             return Err(io::Error::new(
+                 io::ErrorKind::InvalidInput,
+                 format!("Node@(0x{:X}) doesn't exist.", addr)
+             ))
+         }
+         node = self.objects.get(&addr).unwrap();
+         match node.tp_name.as_str() { 
+             "dict" => {
+                 self.parse_dict(node.base_addr)
+             },
+             // "list" => {
+             //     self.parse_list(node)
+             // },
+             // "str" => {
+             //     self.parse_str(node)
+             // },
+             // "unicode" => {
+             //     self.parse_unicode(node)
+             // },
+             // "NoneType" => {
+             //     self.parse_NoneType(node)
+             // },
+             // "int" => {
+             //     self.parse_int(node)
+             // },
+             // "float" => {
+             //     self.parse_float(node)
+             // },
+             // "long" => {
+             //     self.parse_long(node)
+             // },
+             // "bool" => {
+             //     self.parse_bool(node)
+             // },
+             _ => {
+                 todo!()
+             }
+         }
+     }
+     pub fn parse_dict(&mut self, addr: u64) -> io::Result<()> {
+         let node = self.objects.get_mut(&addr).ok_or(
+             io::Error::new(
+                 io::ErrorKind::InvalidInput,
+                 format!("Can't find object at 0x{:X} to parse", addr)
+             )
+         )?;
          if node.tp_name != "dict" {
              return Err(io::Error::new(
                  io::ErrorKind::InvalidInput,
                  format!("parse_dict expect a PyObjectNode of type `dict`, get `{}`", node.tp_name)
              ))
          }
-         let attr_dict_view = node.region.view_bytes_as::<CPyDictObject>(0, None)?;
+         let attr_dict_view = self.regions.get_mut(&node.base_addr).ok_or(
+             io::Error::new(
+                 io::ErrorKind::InvalidInput,
+                 format!("Can't find region at 0x{:X}", node.base_addr)
+             )
+         )?.view_bytes_as::<CPyDictObject>(0, None)?;
          let mask = attr_dict_view.ma_mask;
          let ma_table = attr_dict_view.ma_table;
-
-         let mut result = HashMap::new();
 
          for i in 0..mask+1 {
              if let Ok(entry_region) = self.process.read_memory(
@@ -58,64 +86,45 @@ impl EVEProcess {
                      if me_key_addr == 0 || me_value_addr == 0 {
                          continue
                      }
-                     if let Ok(key_obj) = PyObjectNode::new_from_memory(me_key_addr, self) {
-                         let mut key = "".to_string();
-                         if key_obj.tp_name == "str" {
-                             if let Ok(k) = self.parse_str(&key_obj) {
-                                 key = k
-                             } else { continue }
-                         } else if key_obj.tp_name == "unicode" { 
-                             if let Ok(k) = self.parse_unicode(&key_obj) {
-                                 key = k
-                             } else { continue }
-                         }
-                         if let Ok(value_obj) = PyObjectNode::new_from_memory(me_value_addr, self) {
-                             result.insert(key, value_obj);
-                         }
+                     if let Ok(_) = self.new_node(me_key_addr) {
+                         // if let Ok(_) = self.new_node(me_value_addr) {
+                         //     node.attrs.insert(me_key_addr, me_value_addr);
+                         // } else { 
+                         //     let _ = self.del_node(me_key_addr);
+                         // }
                      }
                  }
              }
          }
-         Ok(result)
+         node.is_parsed = true;
+         Ok(())
      }
-    
-    pub fn parse_list(&self, node: & PyObjectNode) -> io::Result<Vec<PyObjectNode>> {
+
+    pub fn parse_list<'l>(&mut self, node: &'l mut PyObjectNode) -> io::Result<&'l mut PyObjectNode> {
         if node.tp_name != "list" {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("parse_list expect a PyObjectNode of type `list`, get `{}`", node.tp_name)
             ))
         }
-        let list_view = node.region.view_bytes_as::<CPyListObject>(0, None)?;
-        let ob_size = list_view.ob_base.ob_size;
-        let var_obj_size = size_of::<CPyListObject>() + ob_size as usize - 1;
-        let resized_node = self.process.read_cache(
-            node.base_addr, var_obj_size
+        let list_region = self.regions.get_mut(&node.base_addr).ok_or(
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Can't find region at 0x{:X}", node.base_addr)
+            )
         )?;
-        let item_addr_array = resized_node.view_bytes_as_vec_of::<u64>(
-            (list_view.ob_item.as_ptr() as u64 - node.base_addr) as usize, 
+        let list_view = list_region.view_bytes_as::<CPyListObject>(0, None)?;
+        let ob_size = list_view.ob_base.ob_size;
+        let obj_list = list_region.view_bytes_as_vec_of::<u64>(
+            CPyListObject::<1>::OFFSET_OB_ITEM.offset(),
             ob_size as usize
         )?;
-        // for obj_addr in item_addr_array {
-        //     let item_addr = item_addr_array[i as usize];
-        //     self.parse_object(item_addr)?;
+        // for &obj_addr in obj_list {
+        //     if let Ok(_) = self.new_node(obj_addr) {
+        //         node.items.push(obj_addr);
+        //     }
         // }
-        // 
-        // let mut result = Vec::with_capacity(ob_size as usize);
-        // for i in 0..ob_size {
-        //     let item_addr = item_addr_array[i as usize];
-        //     result.push(self.parse_object(item_addr)?);
-        // }
-        // 
-        // node.region.view_bytes_as_vec_of::<u64>(
-        //     (list_view.ob_item.as_ptr() as u64 - node.base_addr) as usize,
-        //     (ob_size as u64 * size_of::<u64>() as u64) as usize
-        // )?.into_iter().enumerate().map(
-        //     |(i, d)| (*d as i64) * 2_i64.pow(30_u32 * i as u32)
-        // ).reduce(|acc, x| acc + x).ok_or(
-        //     io::Error::new(io::ErrorKind::InvalidInput, "parse_long failed")
-        // )
-        todo!()
+        Ok(node)
     }
 
     pub fn parse_str(&self, node: &PyObjectNode) -> io::Result<String> {

@@ -4,6 +4,7 @@ use std::mem::ManuallyDrop;
 use lazy_static::lazy_static;
 use libc::*;
 use loop_code::repeat;
+use repr_offset::ReprOffset;
 
 
 macro_rules! rpointer {
@@ -41,7 +42,7 @@ pub struct CPyTypeObject {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, ReprOffset)]
 pub struct CPyByteArrayObject<const N: usize = 1> {
     pub ob_base: CPyVarObject,
     pub ob_exports: c_int,
@@ -50,7 +51,7 @@ pub struct CPyByteArrayObject<const N: usize = 1> {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, ReprOffset)]
 pub struct CPyStringObject<const N: usize = 1> {
     pub ob_base: CPyVarObject,
     pub ob_shash: c_long,
@@ -97,7 +98,7 @@ pub struct CPyIntObject {
 pub type CPyBoolObject = CPyIntObject;
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, ReprOffset)]
 pub struct CPyListObject<const N: usize = 1> {
     pub ob_base: CPyVarObject,
     pub ob_item: rarray![rpyobject, N],
@@ -105,7 +106,7 @@ pub struct CPyListObject<const N: usize = 1> {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, ReprOffset)]
 pub struct CPyLongObject<const N: usize = 1> {
     pub ob_base: CPyVarObject,
     pub ob_digit: rarray![u32, N]
@@ -128,7 +129,7 @@ pub struct CPySetObject {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, ReprOffset)]
 pub struct CPyTupleObject<const N: usize = 1> {
     pub ob_base: CPyVarObject,
     pub ob_item: rarray![rpyobject, N]
