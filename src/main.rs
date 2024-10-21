@@ -2,7 +2,6 @@ use timeit::timeit_loops;
 use pyevereader::eve_process::eve_process::EVEProcess;
 use std::io;
 use timeit::timeit;
-use rayon::prelude::*;
 
 #[profiling::function]
 fn main() -> io::Result<()> {
@@ -14,14 +13,12 @@ fn main() -> io::Result<()> {
     });
     let mut proc = found.remove(0);
     timeit!({
-        proc.init();
+        proc.init()?;
     });
     // let &ui_root_type = proc.search_type("UIRoot", None).get(0).unwrap();
     println!("type: {}", proc.py_type);
-    println!("UIRoot type: 0x{:X}", proc.ui_root);
-    for ui_root_candidate in proc.search_ui_root(None)? {
-        println!("{:?}", ui_root_candidate);
-    }
+    println!("UIRoot type: 0x{:X}", proc.ui_root_type);
+    println!("UIRoot: 0x{:X}", proc.ui_root);
     profiling::finish_frame!();
     Ok(())
 }

@@ -1,62 +1,16 @@
 use crate::eve_process::process::{MemoryRegion, Process};
 use crate::eve_process::py_struct::*;
+use crate::eve_process::pyobject_node::*;
 use lazy_static::lazy_static;
 use rayon::prelude::*;
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
-use std::hash::{BuildHasher, Hash};
-use std::{io, mem};
-use std::rc::{Rc, Weak};
-use std::time::{SystemTime, UNIX_EPOCH};
-use libc::c_char;
+use std::io;
 use tracing::debug;
-use rustc_hash::FxBuildHasher;
-use smart_default::SmartDefault;
-use crate::eve_process::eve_process::PyObject::PyTypeObject;
+
 
 lazy_static! {
     static ref _py_types: Vec<&'static str> = vec!["UIRoot"];
-}
-
-// static HASHER: FxHasher = FxHasher::default();
-
-#[derive(Debug, Eq, PartialEq, Hash)]
-pub enum Index {
-    Name(String),
-    Index(usize),
-}
-
-#[derive(Debug, SmartDefault)]
-pub enum PyObject {
-    PyObject(CPyObject),
-    PyTypeObject(CPyTypeObject),
-    PyStringObject(CPyStringObject),
-    PyUnicodeObject(CPyUnicodeObject),
-    PyBytesObject(CPyBytesObject),
-    PyByteArrayObject(CPyByteArrayObject),
-    PyListObject(CPyListObject),
-    PyTupleObject(CPyTupleObject),
-    PyDictObject(CPyDictObject),
-    PySetObject(CPySetObject),
-    PyLongObject(CPyLongObject),
-    PyFloatObject(CPyFloatObject),
-    PyIntObject(CPyIntObject),
-    PyBoolObject(CPyBoolObject),
-    PyCustomObject(CPyCustomObject),
-    PyNoneObject(),
-    #[default]
-    Invalid(),
-}
-
-#[derive(Debug, Default)]
-pub struct PyObjectNode {
-    pub base_addr: u64,
-    pub ob_type: u64,
-    pub tp_name: String,
-    pub attrs: HashMap<u64, u64>,
-    pub items: Vec<u64>,
-    pub extras: Vec<u64>,
-    pub is_parsed: bool
 }
 
 #[derive(Debug)]
@@ -65,6 +19,7 @@ pub struct EVEProcess {
     pub objects: HashMap<u64, PyObjectNode>,
     pub regions: HashMap<u64, MemoryRegion>,
     pub py_type: u64,
+    pub ui_root_type: u64,
     pub ui_root: u64
 }
 
@@ -112,141 +67,20 @@ macro_rules! par_map_regions {
     };
 }
 
-impl EVEProcess {
-    pub fn new_node(&mut self, base_addr: u64) -> io::Result<&mut PyObjectNode> {
-        if base_addr == 0 {
-            return Err(io::Error::new(io::ErrorKind::Other, "invalid base_addr"));
-        }
-        let mut tp_name_size = 255;
-        let mut pyobj_region = self.process.read_memory(base_addr, size_of::<CPyObject>())?;
-        let pyobj_view = pyobj_region.view_bytes_as::<CPyObject>(0, None)?;
-        let pyobj_type_addr = pyobj_view.ob_type;
-        
-        let tp_name_inferred;
-        // get existing type objects or put new one into cache, we assume that no new type object
-        // will be created dynamically.
-        if pyobj_type_addr == base_addr {
-            if self.objects.contains_key(&base_addr) {
-                return Ok(self.objects.get_mut(&base_addr).unwrap());
-            }
-            let pyobj_type_region = self.process.read_cache(pyobj_type_addr, size_of::<CPyTypeObject>())?;
-            let obj = PyObjectNode {
-                base_addr,
-                ob_type: pyobj_type_addr,
-                tp_name: "type".to_string(),
-                attrs: Default::default(),
-                items: vec![],
-                extras: vec![],
-                is_parsed: true,
-            };
-            self.objects.insert(base_addr, obj);
-            self.regions.insert(base_addr, pyobj_type_region);
-            return Ok(self.objects.get_mut(&base_addr).unwrap());
-        } else if self.objects.contains_key(&pyobj_type_addr) {
-            let tp_obj = self.objects.get(&pyobj_type_addr).unwrap().clone();
-            tp_name_inferred = tp_obj.tp_name.clone();
-        } else {
-            let pyobj_type_region = self.process.read_cache(pyobj_type_addr, size_of::<CPyTypeObject>())?;
-            let pyobj_tp_name_addr = pyobj_type_region.view_bytes_as::<CPyTypeObject>(0, None)?.tp_name;
-            let pyobj_tp_name_region = self.process.read_cache(pyobj_tp_name_addr, tp_name_size)?;
-            let pyobj_tp_name = &pyobj_tp_name_region.data;
-            for l in 0..tp_name_size {
-                if pyobj_tp_name[l] == 0 {
-                    tp_name_size = l;
-                    break;
-                }
-            }
-            tp_name_inferred = if tp_name_size > 0 {
-                String::from_utf8_lossy(&pyobj_tp_name[0..tp_name_size]).into_owned()
-            } else {
-                return Err(io::Error::new(io::ErrorKind::Other, "invalid ob_type"));
-            };
-            let tp_obj = PyObjectNode {
-                base_addr,
-                ob_type: base_addr,
-                tp_name: String::from_utf8_lossy(&pyobj_tp_name[0..tp_name_size]).into_owned(),
-                attrs: Default::default(),
-                items: vec![],
-                extras: vec![],
-                is_parsed: true,
-            };
-            self.objects.insert(pyobj_type_addr, tp_obj);
-            self.regions.insert(pyobj_type_addr, pyobj_type_region);
-        }
-
-        // remove type object from cache if it exists
-        let _ = self.del_node(base_addr);
-
-        // handle var python object
-        let var_size: usize = match tp_name_inferred.as_str() {
-            "str" | "bytearray" | "bytes" | "list" | "long" | "tuple" => {
-                let var_region = self.process.read_memory(base_addr, size_of::<CPyVarObject>())?;
-                let var_view = var_region.view_bytes_as::<CPyVarObject>(0, None)?;
-                var_view.ob_size.abs() as usize
-            },
-            _ => { 0 }
-        };
-
-        let obj_size: usize = match tp_name_inferred.as_str() {
-            "str" => { size_of::<CPyStringObject>() }
-            "bytearray" => { size_of::<CPyByteArrayObject>() }
-            "bytes" => { size_of::<CPyBytesObject>() }
-            "list" => { size_of::<CPyListObject>() }
-            "long" => { size_of::<CPyLongObject>() }
-            "tuple" => { size_of::<CPyTupleObject>() }
-            "dict" => { size_of::<CPyDictObject>() }
-            "bool" => { size_of::<CPyBoolObject>() }
-            "float" => { size_of::<CPyFloatObject>() }
-            "int" => { size_of::<CPyIntObject>() }
-            "NoneType" => { size_of::<CPyObject>() }
-            "unicode" => { size_of::<CPyUnicodeObject>() }
-            "type" => { size_of::<CPyTypeObject>() }
-            _ => { size_of::<CPyCustomObject>() }
-        };
-
-        // reload region with new size
-        pyobj_region = self.process.read_memory(base_addr, obj_size + var_size)?;
-        let obj = PyObjectNode {
-            base_addr,
-            ob_type: pyobj_type_addr,
-            tp_name: tp_name_inferred,
-            attrs: Default::default(),
-            items: vec![],
-            extras: vec![],
-            is_parsed: false,
-        };
-        self.objects.insert(base_addr, obj);
-        self.regions.insert(base_addr, pyobj_region);
-        Ok(self.objects.get_mut(&base_addr).unwrap())
-    }
-    
-    pub fn del_node(&mut self, base_addr: u64) -> io::Result<()> {
-        if !self.objects.contains_key(&base_addr) {
-            return Err(io::Error::new(io::ErrorKind::Other, "invalid base_addr"));
-        }
-        let obj = self.objects.remove(&base_addr).unwrap();
-        for dedicated_regions in obj.extras.iter() {
-            self.regions.remove(dedicated_regions);
-        }
-        Ok(())
-    }
-
-
-}
-
 #[profiling::all_functions]
 impl EVEProcess {
-    pub fn list() -> io::Result<Vec<EVEProcess>> {
+    pub fn list() -> io::Result<Vec<Self>> {
         let p: Vec<_> = Process::list(None, Some("*exefile*"), Some("*星战前夜*"))?
             .into_iter()
-            .map(|proc| -> EVEProcess {
+            .map(|proc| -> Self {
                 let proc = proc.enum_memory_regions();
                 let proc = proc.sync_memory_regions();
-                EVEProcess {
+                Self {
                     process: proc,
                     objects: Default::default(),
                     regions: Default::default(),
                     py_type: 0,
+                    ui_root_type: 0,
                     ui_root: 0,
                 }
             })
@@ -313,15 +147,15 @@ impl EVEProcess {
             {
                 debug!("Found verified type candidate: {}", tp_candidate);
                 self.objects = Default::default();
-                let py_type = self.new_node(tp_candidate)?;
+                self.new_node(tp_candidate)?;
                 self.py_type = tp_candidate;
                 for (&tp_name, &tp_addr) in
                     verified_type_candidates.get(&tp_candidate).unwrap().iter()
                 {
                     
-                    let tp_obj = self.new_node(tp_addr)?;
+                    self.new_node(tp_addr)?;
                     if tp_name.eq("UIRoot") {
-                        self.ui_root = tp_addr;
+                        self.ui_root_type = tp_addr;
                     }
                 }
                 verified_type_addr = tp_candidate;
@@ -329,7 +163,25 @@ impl EVEProcess {
             }
         }
         if verified_type_addr != 0 {
-            Ok(verified_type_addr)
+            let mut ui_root_obj_candidates = self.search_ui_root(None)?;
+            match ui_root_obj_candidates.len() { 
+                0_usize => {
+                    Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        "Failed to find UIRoot object."
+                    ))
+                },
+                1_usize => {
+                    Ok(ui_root_obj_candidates[0])
+                },
+                _ => {
+                    ui_root_obj_candidates.sort_by_key(|&x| {
+                        - (self.new_node(x).unwrap_or(Vec::new()).len() as i32)
+                    });
+                    self.ui_root = ui_root_obj_candidates[0];
+                    Ok(ui_root_obj_candidates[0])
+                }
+            }
         } else {
             Err(io::Error::new(io::ErrorKind::Other, "Failed to find verified type candidate."))
         }
@@ -369,7 +221,7 @@ impl EVEProcess {
     }
 
     pub fn search_ui_root(&self, tp_addr: Option<u64>) -> io::Result<Vec<u64>> {
-        let tp_addr = tp_addr.unwrap_or(self.ui_root);
+        let tp_addr = tp_addr.unwrap_or(self.ui_root_type);
         if tp_addr == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
@@ -405,12 +257,16 @@ impl EVEProcess {
         );
         Ok(res)
     }
-    
-    pub fn parse_ui_tree(&mut self, ui_root_addr: u64) -> Option<PyObjectNode> {
-        let region = self.process.read_cache(ui_root_addr, size_of::<CPyCustomObject>()).ok()?;
-        let py_obj_view = region.view_bytes_as::<CPyCustomObject>(0, None).ok()?;
 
+    pub fn new_node(&mut self, base_addr: u64) -> io::Result<Vec<u64>> {
+        new_node(base_addr, &self.process, &mut self.objects, &mut self.regions)
+    }
 
-        todo!()
+    pub fn del_node(&mut self, base_addr: u64) -> io::Result<PyObjectNode> {
+        del_node(base_addr, &mut self.objects, &mut self.regions)
+    }
+
+    pub fn resolve_node(&mut self, addr: u64) -> io::Result<Vec<u64>> {
+        resolve_node(addr, &self.process, &mut self.objects, &mut self.regions)
     }
 }

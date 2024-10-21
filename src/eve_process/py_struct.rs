@@ -1,9 +1,4 @@
-use std::io;
-use std::io::Error;
-use std::mem::ManuallyDrop;
-use lazy_static::lazy_static;
 use libc::*;
-use loop_code::repeat;
 use repr_offset::ReprOffset;
 
 
@@ -12,7 +7,7 @@ macro_rules! rpointer {
     () => {u64}
 }
 
-type rpyobject = rpointer![CPyObject];
+type RPyObject = rpointer![CPyObject];
 
 macro_rules! rarray {
     ($T:ty, $n:expr) => {[$T; $n]};
@@ -65,8 +60,8 @@ pub type CPyBytesObject<const N: usize = 1> = CPyStringObject<N>;
 #[derive(Debug, Clone, Copy)]
 pub struct CPyDictEntry {
     pub me_hash: ssize_t,
-    pub me_key: rpyobject,
-    pub me_value: rpyobject
+    pub me_key: RPyObject,
+    pub me_value: RPyObject
 }
 
 #[repr(C)]
@@ -101,7 +96,7 @@ pub type CPyBoolObject = CPyIntObject;
 #[derive(Debug, Clone, Copy, ReprOffset)]
 pub struct CPyListObject<const N: usize = 1> {
     pub ob_base: CPyVarObject,
-    pub ob_item: rarray![rpyobject, N],
+    pub ob_item: rarray![RPyObject, N],
     pub allocated: ssize_t
 }
 
@@ -115,7 +110,7 @@ pub struct CPyLongObject<const N: usize = 1> {
 #[repr(C)]
 pub struct CPySetEntry {
     pub hash: c_long,
-    pub key: rpyobject
+    pub key: RPyObject
 }
 
 #[repr(C)]
@@ -132,7 +127,7 @@ pub struct CPySetObject {
 #[derive(Debug, Clone, Copy, ReprOffset)]
 pub struct CPyTupleObject<const N: usize = 1> {
     pub ob_base: CPyVarObject,
-    pub ob_item: rarray![rpyobject, N]
+    pub ob_item: rarray![RPyObject, N]
 }
 
 #[repr(C)]
@@ -142,7 +137,7 @@ pub struct CPyUnicodeObject {
     pub length: ssize_t,
     pub str: rpointer![wchar_t],
     pub hash: c_long,
-    pub defenc: rpyobject
+    pub defenc: RPyObject
 }
 
 #[repr(C)]

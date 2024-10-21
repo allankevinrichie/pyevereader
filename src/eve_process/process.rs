@@ -1,12 +1,12 @@
 use rayon::prelude::*;
 use std::ffi::OsString;
 use std::fmt::Debug;
-use std::{io, result};
+use std::io;
 use std::io::Error;
 use std::num::NonZeroUsize;
 use std::os::windows::ffi::OsStringExt;
 use lazy_static::lazy_static;
-use tracing::{debug, info, warn};
+use tracing::*;
 use wildmatch::WildMatch;
 use winapi::shared::minwindef::{BOOL, DWORD, FALSE, LPARAM, LPVOID, TRUE};
 use winapi::shared::ntdef::{HANDLE, NULL};
@@ -134,7 +134,6 @@ impl MemoryRegion {
         if offset + size > self.size {
             Err(Error::new(io::ErrorKind::InvalidInput, "Invalid offset or size"))
         } else {
-            let v: Vec::<&T>;
             Ok(unsafe {
                 let t: Vec<_> = self.data[offset..offset + size]
                     .into_iter()
@@ -153,7 +152,8 @@ impl Process {
         pid: Option<u32>,
         path: Option<&str>,
         title: Option<&str>,
-    ) -> io::Result<Vec<Self>> {
+    ) -> io::Result<Vec<Self>> 
+    {
         match list_processes() {
             Err(e) => Err(e),
             Ok(processes) => {
@@ -185,7 +185,7 @@ impl Process {
         let max_addr = sysinfo.lpMaximumApplicationAddress as u64;
         let step = 256 * (1 << 20);
         let batch_size = step * 256;
-        let num_batches = ((max_addr - min_addr + 1) / batch_size);
+        let num_batches = (max_addr - min_addr + 1) / batch_size;
         let mut regions_list = Vec::with_capacity(num_batches as usize);
         for i in 0..num_batches {
             let batch_min_addr = i * batch_size + min_addr;
